@@ -11,6 +11,9 @@ import {
   createEmptySyncState,
   getNotebooksToSync,
   updateNotebookState,
+  recordFailedSync,
+  clearFailedSync,
+  getFailedNotebookIds,
 } from "./state";
 
 /** Callback for sync progress updates. */
@@ -119,6 +122,17 @@ export class SyncEngine {
           return notebooks.find((nb) => nb.asin === n.asin)!;
         });
 
+    // Also include previously failed notebooks for retry
+    if (!forceAll) {
+      const failedIds = getFailedNotebookIds(this.state);
+      for (const failedId of failedIds) {
+        const notebook = notebooks.find((nb) => nb.asin === failedId);
+        if (notebook && !toSync.find((n) => n.asin === failedId)) {
+          toSync.push(notebook);
+        }
+      }
+    }
+
     if (toSync.length === 0) {
       onProgress?.(1, 1, "All notebooks up to date.");
       return result;
@@ -141,9 +155,18 @@ export class SyncEngine {
           notebook.modificationTime,
           notebook.totalPages
         );
+        // Clear from failed list if it was a retry
+        this.state = clearFailedSync(this.state, notebook.asin);
         result.synced++;
       } catch (e: any) {
         result.errors.push(`${notebook.title}: ${e.message}`);
+        // Record the failure for retry on next sync
+        this.state = recordFailedSync(
+          this.state,
+          notebook.asin,
+          notebook.title,
+          e.message
+        );
         console.error(`Failed to sync notebook "${notebook.title}":`, e);
       }
     }
