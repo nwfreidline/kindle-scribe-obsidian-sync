@@ -7,6 +7,7 @@ import { OpenAIProvider } from "./processing/providers/openai";
 import { AnthropicProvider } from "./processing/providers/anthropic";
 import { SyncEngine, SyncResult } from "./sync/engine";
 import { SyncState, createEmptySyncState } from "./sync/state";
+import { SyncProgressModal, SyncStatusBar } from "./utils/progress";
 import {
   KindleScribeSettings,
   KindleScribeSettingTab,
@@ -32,6 +33,7 @@ export default class KindleScribePlugin extends Plugin {
   private auth!: AmazonAuthManager;
   private syncEngine!: SyncEngine;
   private syncIntervalId: number | null = null;
+  private statusBar: SyncStatusBar | null = null;
 
   async onload(): Promise<void> {
     // Load persisted data
@@ -89,6 +91,12 @@ export default class KindleScribePlugin extends Plugin {
     this.addRibbonIcon("notebook", "Sync Kindle Scribe", () => {
       this.runSync(false);
     });
+
+    // Add status bar item
+    const statusBarItemEl = this.addStatusBarItem();
+    this.statusBar = new SyncStatusBar(statusBarItemEl);
+    const state = this.syncEngine.getState();
+    this.statusBar.setIdle(state.lastSyncTime);
 
     // Auto-sync on startup
     if (this.settings.autoSync) {
@@ -159,35 +167,42 @@ export default class KindleScribePlugin extends Plugin {
       return;
     }
 
-    new Notice("Kindle Scribe: Starting sync...");
+    // Show progress modal
+    const progressModal = new SyncProgressModal(this.app);
+    progressModal.open();
+    this.statusBar?.setSyncing();
+
+    let cancelled = false;
+    progressModal.onCancel = () => {
+      cancelled = true;
+    };
 
     let result: SyncResult;
     try {
-      if (forceAll) {
-        result = await this.syncEngine.syncAll((current, total, message) => {
-          // Could update a status bar here in the future
-          console.log(`[Kindle Scribe] ${message} (${current}/${total})`);
-        });
-      } else {
-        result = await this.syncEngine.syncIncremental((current, total, message) => {
-          console.log(`[Kindle Scribe] ${message} (${current}/${total})`);
-        });
-      }
+      const syncFn = forceAll
+        ? this.syncEngine.syncAll.bind(this.syncEngine)
+        : this.syncEngine.syncIncremental.bind(this.syncEngine);
+
+      result = await syncFn((current: number, total: number, message: string) => {
+        if (cancelled) return;
+        progressModal.updateProgress(current, total, message);
+      });
 
       if (result.success) {
-        new Notice(
-          `Kindle Scribe: Synced ${result.synced} notebook(s), ${result.skipped} up to date.`
-        );
+        const msg = `Synced ${result.synced} notebook(s), ${result.skipped} up to date.`;
+        progressModal.complete(msg);
+        this.statusBar?.setIdle(Date.now());
       } else {
-        new Notice(
-          `Kindle Scribe: Sync completed with errors. ${result.errors.length} error(s).`
-        );
+        const msg = `Completed with ${result.errors.length} error(s). ${result.synced} synced.`;
+        progressModal.complete(msg);
+        this.statusBar?.setError();
         for (const error of result.errors) {
           console.error(`[Kindle Scribe] ${error}`);
         }
       }
     } catch (e: any) {
-      new Notice(`Kindle Scribe: Sync failed — ${e.message}`);
+      progressModal.complete(`Sync failed: ${e.message}`);
+      this.statusBar?.setError();
       console.error("[Kindle Scribe] Sync error:", e);
     }
   }

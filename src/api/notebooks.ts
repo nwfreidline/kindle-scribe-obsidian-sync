@@ -8,6 +8,7 @@ import {
   PageImage,
   RenderPageOptions,
 } from "./types";
+import { withRetry } from "../utils/retry";
 
 /** Batch size for page rendering requests. */
 const PAGE_BATCH_SIZE = 3;
@@ -27,18 +28,22 @@ export class NotebookClient {
    * Fetch all notebooks from the user's Kindle account.
    */
   async listNotebooks(): Promise<NotebookMetadata[]> {
-    const response = await this.auth.makeAuthenticatedRequest(
-      `${KINDLE_API_BASE}/kindle-notebook/api/notes`
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to fetch notebooks: ${response.status} ${response.statusText}`
+    return withRetry(async () => {
+      const response = await this.auth.makeAuthenticatedRequest(
+        `${KINDLE_API_BASE}/kindle-notebook/api/notes`
       );
-    }
 
-    const data: NotebookListResponse = await response.json();
-    return data.itemsList || [];
+      if (!response.ok) {
+        const error: any = new Error(
+          `Failed to fetch notebooks: ${response.status} ${response.statusText}`
+        );
+        error.status = response.status;
+        throw error;
+      }
+
+      const data: NotebookListResponse = await response.json();
+      return data.itemsList || [];
+    });
   }
 
   /**
@@ -48,18 +53,22 @@ export class NotebookClient {
     notebookId: string,
     marketplace: string
   ): Promise<OpenNotebookResponse> {
-    const marketplaceId = MARKETPLACES[marketplace] || marketplace;
-    const url = `${KINDLE_API_BASE}/openNotebook?notebookId=${encodeURIComponent(notebookId)}&marketplaceId=${encodeURIComponent(marketplaceId)}`;
+    return withRetry(async () => {
+      const marketplaceId = MARKETPLACES[marketplace] || marketplace;
+      const url = `${KINDLE_API_BASE}/openNotebook?notebookId=${encodeURIComponent(notebookId)}&marketplaceId=${encodeURIComponent(marketplaceId)}`;
 
-    const response = await this.auth.makeAuthenticatedRequest(url);
+      const response = await this.auth.makeAuthenticatedRequest(url);
 
-    if (!response.ok) {
-      throw new Error(
-        `Failed to open notebook ${notebookId}: ${response.status} ${response.statusText}`
-      );
-    }
+      if (!response.ok) {
+        const error: any = new Error(
+          `Failed to open notebook ${notebookId}: ${response.status} ${response.statusText}`
+        );
+        error.status = response.status;
+        throw error;
+      }
 
-    return response.json();
+      return response.json();
+    });
   }
 
   /**
@@ -103,27 +112,31 @@ export class NotebookClient {
     renderingToken: string,
     options: RenderPageOptions
   ): Promise<PageImage[]> {
-    const url = new URL(`${KINDLE_API_BASE}/renderPage`);
-    url.searchParams.set("startPage", options.startPage.toString());
-    url.searchParams.set("endPage", options.endPage.toString());
-    url.searchParams.set("width", (options.width || DEFAULT_WIDTH).toString());
-    url.searchParams.set("height", (options.height || DEFAULT_HEIGHT).toString());
-    url.searchParams.set("dpi", (options.dpi || 50).toString());
+    return withRetry(async () => {
+      const url = new URL(`${KINDLE_API_BASE}/renderPage`);
+      url.searchParams.set("startPage", options.startPage.toString());
+      url.searchParams.set("endPage", options.endPage.toString());
+      url.searchParams.set("width", (options.width || DEFAULT_WIDTH).toString());
+      url.searchParams.set("height", (options.height || DEFAULT_HEIGHT).toString());
+      url.searchParams.set("dpi", (options.dpi || 50).toString());
 
-    const response = await this.auth.makeAuthenticatedRequest(url.toString(), {
-      headers: {
-        "x-amzn-karamel-notebook-rendering-token": renderingToken,
-      },
+      const response = await this.auth.makeAuthenticatedRequest(url.toString(), {
+        headers: {
+          "x-amzn-karamel-notebook-rendering-token": renderingToken,
+        },
+      });
+
+      if (!response.ok) {
+        const error: any = new Error(
+          `Failed to render pages ${options.startPage}-${options.endPage}: ${response.status}`
+        );
+        error.status = response.status;
+        throw error;
+      }
+
+      const tarBuffer = await response.arrayBuffer();
+      return this.extractImagesFromTar(tarBuffer, options.startPage);
     });
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to render pages ${options.startPage}-${options.endPage}: ${response.status}`
-      );
-    }
-
-    const tarBuffer = await response.arrayBuffer();
-    return this.extractImagesFromTar(tarBuffer, options.startPage);
   }
 
   /**

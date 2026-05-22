@@ -20,12 +20,18 @@ export type SyncProgressCallback = (
   message: string
 ) => void;
 
+/** Cancellation token for aborting sync operations. */
+export interface CancellationToken {
+  isCancelled: () => boolean;
+}
+
 /** Result of a sync operation. */
 export interface SyncResult {
   success: boolean;
   synced: number;
   skipped: number;
   errors: string[];
+  cancelled?: boolean;
 }
 
 /**
