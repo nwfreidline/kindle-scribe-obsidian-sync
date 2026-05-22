@@ -1,0 +1,17 @@
+# Build output
+main.js
+dist/
+
+# Dependencies
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Obsidian plugin data (local testing)
+data.json

@@ -1,0 +1,31 @@
+{
+  "name": "kindle-scribe-obsidian-plugin",
+  "version": "0.1.0",
+  "description": "Sync handwritten notes from Kindle Scribe into your Obsidian vault",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "kindle",
+    "scribe",
+    "sync",
+    "handwriting",
+    "ocr"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "latest",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "jspdf": "^2.5.1",
+    "js-untar": "^2.0.0"
+  }
+}
