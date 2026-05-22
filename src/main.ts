@@ -8,6 +8,7 @@ import { AnthropicProvider } from "./processing/providers/anthropic";
 import { SyncEngine, SyncResult } from "./sync/engine";
 import { SyncState, createEmptySyncState } from "./sync/state";
 import { SyncProgressModal, SyncStatusBar } from "./utils/progress";
+import { NotebookPickerModal } from "./ui/notebook-picker";
 import {
   KindleScribeSettings,
   KindleScribeSettingTab,
@@ -19,6 +20,7 @@ interface PluginData {
   settings: KindleScribeSettings;
   session: AmazonSession | null;
   syncState: SyncState;
+  selectedNotebooks: string[];
 }
 
 /**
@@ -85,6 +87,12 @@ export default class KindleScribePlugin extends Plugin {
       id: "logout",
       name: "Logout from Amazon",
       callback: () => this.logoutFromAmazon(),
+    });
+
+    this.addCommand({
+      id: "select-notebooks",
+      name: "Select notebooks to sync",
+      callback: () => this.selectNotebooks(),
     });
 
     // Add ribbon icon
@@ -158,6 +166,42 @@ export default class KindleScribePlugin extends Plugin {
     const data = await this.loadPersistedData();
     data.session = null;
     await this.saveData(data);
+  }
+
+  /** Open the notebook picker to let users choose which notebooks to sync. */
+  private async selectNotebooks(): Promise<void> {
+    if (!this.auth.isAuthenticated()) {
+      new Notice("Please log in to Amazon first.");
+      return;
+    }
+
+    try {
+      const { NotebookClient } = await import("./api/notebooks");
+      const client = new NotebookClient(this.auth);
+      const notebooks = await client.listNotebooks();
+
+      if (notebooks.length === 0) {
+        new Notice("No notebooks found in your Kindle Scribe account.");
+        return;
+      }
+
+      const data = await this.loadPersistedData();
+      const previouslySelected = data.selectedNotebooks || [];
+
+      new NotebookPickerModal(
+        this.app,
+        notebooks,
+        previouslySelected,
+        async (selectedIds) => {
+          const current = await this.loadPersistedData();
+          current.selectedNotebooks = selectedIds;
+          await this.saveData(current);
+          new Notice(`${selectedIds.length} notebook(s) selected for sync.`);
+        }
+      ).open();
+    } catch (e: any) {
+      new Notice(`Failed to fetch notebooks: ${e.message}`);
+    }
   }
 
   /** Run a sync operation (incremental or full). */
@@ -252,6 +296,7 @@ export default class KindleScribePlugin extends Plugin {
       settings: { ...DEFAULT_SETTINGS, ...(raw?.settings || {}) },
       session: raw?.session || null,
       syncState: raw?.syncState || createEmptySyncState(),
+      selectedNotebooks: raw?.selectedNotebooks || [],
     };
   }
 }
