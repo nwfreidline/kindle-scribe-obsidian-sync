@@ -15,3 +15,10 @@ Thumbs.db
 
 # Obsidian plugin data (local testing)
 data.json
+
+# Python
+__pycache__/
+*.pyc
+kindle_sync/token_cache.json
+kindle_sync/routes.json
+kindle_sync/.kindle_sync_state.json
