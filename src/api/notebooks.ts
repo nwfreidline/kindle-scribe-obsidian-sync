@@ -162,14 +162,13 @@ export class NotebookClient {
 
   /**
    * Extract individual page images from a tar archive buffer.
-   * The tar contains PaxHeaders, JSON metadata, and actual PNG/JPG images.
-   * We only want the image files.
+   * Also extracts and logs JSON metadata which may contain recognized text.
    */
   extractImagesFromTar(tarBuffer: ArrayBuffer, startPage: number): PageImage[] {
     const pages: PageImage[] = [];
     let offset = 0;
 
-    console.log(`[Kindle Scribe] Extracting images from tar buffer: ${tarBuffer.byteLength} bytes`);
+    console.log(`[Kindle Scribe] Extracting from tar buffer: ${tarBuffer.byteLength} bytes`);
 
     while (offset < tarBuffer.byteLength - 512) {
       // Read tar header (512 bytes)
@@ -188,21 +187,31 @@ export class NotebookClient {
       offset += 512; // Move past header
 
       if (fileSize > 0 && filename) {
-        // Only extract actual image files — skip PaxHeaders, JSON, and other metadata
-        const isImage = filename.endsWith(".png") || filename.endsWith(".jpg") || filename.endsWith(".jpeg");
         const isPaxHeader = filename.includes("PaxHeaders");
+        const isImage = filename.endsWith(".png") || filename.endsWith(".jpg") || filename.endsWith(".jpeg");
+        const isJson = filename.endsWith(".json") && !isPaxHeader;
+
+        // Log every non-PaxHeader entry
+        if (!isPaxHeader) {
+          console.log(`[Kindle Scribe] Tar file: "${filename}" (${fileSize} bytes)`);
+        }
 
         if (isImage && !isPaxHeader) {
           const imageData = tarBuffer.slice(offset, offset + fileSize);
           const mimeType = filename.endsWith(".png") ? "image/png" : "image/jpeg";
-
           pages.push({
             pageNumber: startPage + pages.length,
             data: imageData,
             mimeType,
           });
+          console.log(`[Kindle Scribe] Image: "${filename}" ${fileSize} bytes`);
+        }
 
-          console.log(`[Kindle Scribe] Extracted page ${startPage + pages.length - 1}: "${filename}" ${fileSize} bytes (${mimeType})`);
+        // Log JSON file contents to see if Amazon includes recognized text
+        if (isJson) {
+          const jsonData = tarBuffer.slice(offset, offset + fileSize);
+          const jsonStr = new TextDecoder().decode(new Uint8Array(jsonData));
+          console.log(`[Kindle Scribe] JSON "${filename}": ${jsonStr}`);
         }
       }
 

@@ -1,14 +1,8 @@
 import { Notice, Plugin } from "obsidian";
-import { AmazonAuthManager } from "./api/auth";
-import { AmazonSession } from "./api/types";
-import { OCRProvider } from "./processing/ocr";
-import { OpenRouterProvider } from "./processing/providers/openrouter";
-import { OpenAIProvider } from "./processing/providers/openai";
-import { AnthropicProvider } from "./processing/providers/anthropic";
-import { SyncEngine, SyncResult } from "./sync/engine";
+import { MicrosoftAuthManager, MSAuthToken } from "./api/microsoft-auth";
+import { OneNoteSyncEngine, OneNoteSyncResult } from "./sync/onenote-engine";
 import { SyncState, createEmptySyncState } from "./sync/state";
 import { SyncProgressModal, SyncStatusBar } from "./utils/progress";
-import { NotebookPickerModal } from "./ui/notebook-picker";
 import {
   KindleScribeSettings,
   KindleScribeSettingTab,
@@ -18,22 +12,20 @@ import {
 /** Persisted plugin data shape. */
 interface PluginData {
   settings: KindleScribeSettings;
-  session: AmazonSession | null;
+  msToken: MSAuthToken | null;
   syncState: SyncState;
-  selectedNotebooks: string[];
 }
 
 /**
  * Kindle Scribe Sync — Obsidian Plugin
  *
- * Syncs handwritten notes from Amazon Kindle Scribe into the vault.
- * Supports incremental sync, configurable output formats, and
- * AI-powered OCR transcription.
+ * Syncs handwritten notes from Kindle Scribe (via OneNote) into the vault.
+ * Kindle Scribe → OneNote (automatic) → This plugin → Obsidian markdown
  */
 export default class KindleScribePlugin extends Plugin {
   settings: KindleScribeSettings = DEFAULT_SETTINGS;
-  private auth!: AmazonAuthManager;
-  private syncEngine!: SyncEngine;
+  private msAuth!: MicrosoftAuthManager;
+  private syncEngine!: OneNoteSyncEngine;
   private syncIntervalId: number | null = null;
   private statusBar: SyncStatusBar | null = null;
 
@@ -42,16 +34,16 @@ export default class KindleScribePlugin extends Plugin {
     const data = await this.loadPersistedData();
     this.settings = data.settings;
 
-    // Initialize auth manager
-    this.auth = new AmazonAuthManager(this.app);
-    this.auth.restoreSession(data.session);
+    // Initialize Microsoft auth
+    this.msAuth = new MicrosoftAuthManager(this.app);
+    this.msAuth.setClientId(this.settings.msClientId);
+    this.msAuth.restoreToken(data.msToken);
 
     // Initialize sync engine
-    this.syncEngine = new SyncEngine(
+    this.syncEngine = new OneNoteSyncEngine(
       this.app,
-      this.auth,
+      this.msAuth,
       this.settings,
-      this.getOCRProvider(),
       async () => data.syncState || createEmptySyncState(),
       async (state) => {
         const current = await this.loadPersistedData();
@@ -78,21 +70,15 @@ export default class KindleScribePlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "login",
-      name: "Login to Amazon",
-      callback: () => this.loginToAmazon(),
+      id: "login-microsoft",
+      name: "Login to Microsoft",
+      callback: () => this.loginToMicrosoft(),
     });
 
     this.addCommand({
-      id: "logout",
-      name: "Logout from Amazon",
-      callback: () => this.logoutFromAmazon(),
-    });
-
-    this.addCommand({
-      id: "select-notebooks",
-      name: "Select notebooks to sync",
-      callback: () => this.selectNotebooks(),
+      id: "logout-microsoft",
+      name: "Logout from Microsoft",
+      callback: () => this.logoutFromMicrosoft(),
     });
 
     // Add ribbon icon
@@ -108,7 +94,6 @@ export default class KindleScribePlugin extends Plugin {
 
     // Auto-sync on startup
     if (this.settings.autoSync) {
-      // Delay to let Obsidian finish loading
       this.registerInterval(
         window.setTimeout(() => this.runSync(false), 5000) as any
       );
@@ -128,12 +113,14 @@ export default class KindleScribePlugin extends Plugin {
     data.settings = this.settings;
     await this.saveData(data);
 
+    // Update auth client ID
+    this.msAuth.setClientId(this.settings.msClientId);
+
     // Rebuild sync engine with new settings
-    this.syncEngine = new SyncEngine(
+    this.syncEngine = new OneNoteSyncEngine(
       this.app,
-      this.auth,
+      this.msAuth,
       this.settings,
-      this.getOCRProvider(),
       async () => {
         const d = await this.loadPersistedData();
         return d.syncState || createEmptySyncState();
@@ -146,94 +133,44 @@ export default class KindleScribePlugin extends Plugin {
     );
     await this.syncEngine.initialize();
 
-    // Update sync interval
     this.setupSyncInterval();
   }
 
-  /** Open the Amazon login modal. */
-  async loginToAmazon(): Promise<void> {
-    const session = await this.auth.login(this.settings.marketplace);
-    if (session) {
+  /** Start Microsoft login flow. */
+  async loginToMicrosoft(): Promise<void> {
+    const token = await this.msAuth.login();
+    if (token) {
       const data = await this.loadPersistedData();
-      data.session = session;
+      data.msToken = token;
       await this.saveData(data);
     }
   }
 
-  /** Clear the Amazon session. */
-  async logoutFromAmazon(): Promise<void> {
-    this.auth.logout();
+  /** Logout from Microsoft. */
+  async logoutFromMicrosoft(): Promise<void> {
+    this.msAuth.logout();
     const data = await this.loadPersistedData();
-    data.session = null;
+    data.msToken = null;
     await this.saveData(data);
   }
 
-  /** Open the notebook picker to let users choose which notebooks to sync. */
-  private async selectNotebooks(): Promise<void> {
-    if (!this.auth.isAuthenticated()) {
-      new Notice("Please log in to Amazon first.");
-      return;
-    }
-
-    try {
-      const { NotebookClient } = await import("./api/notebooks");
-      const client = new NotebookClient(this.auth);
-      const notebooks = await client.listNotebooks();
-
-      if (notebooks.length === 0) {
-        new Notice("No notebooks found in your Kindle Scribe account.");
-        return;
-      }
-
-      const data = await this.loadPersistedData();
-      const previouslySelected = data.selectedNotebooks || [];
-
-      new NotebookPickerModal(
-        this.app,
-        notebooks,
-        previouslySelected,
-        async (selectedIds) => {
-          const current = await this.loadPersistedData();
-          current.selectedNotebooks = selectedIds;
-          await this.saveData(current);
-          new Notice(`${selectedIds.length} notebook(s) selected for sync.`);
-        }
-      ).open();
-    } catch (e: any) {
-      new Notice(`Failed to fetch notebooks: ${e.message}`);
-    }
-  }
-
-  /** Run a sync operation (incremental or full). */
+  /** Run a sync operation. */
   private async runSync(forceAll: boolean): Promise<void> {
-    if (!this.auth.isAuthenticated()) {
-      new Notice("Please log in to Amazon first (Settings → Kindle Scribe Sync).");
+    if (!this.msAuth.isAuthenticated()) {
+      new Notice("Please log in to Microsoft first (Settings → Kindle Scribe Sync).");
       return;
     }
 
-    // Show progress modal
     const progressModal = new SyncProgressModal(this.app);
     progressModal.open();
     this.statusBar?.setSyncing();
 
-    let cancelled = false;
-    progressModal.onCancel = () => {
-      cancelled = true;
-    };
-
-    let result: SyncResult;
     try {
-      const syncFn = forceAll
-        ? this.syncEngine.syncAll.bind(this.syncEngine)
-        : this.syncEngine.syncIncremental.bind(this.syncEngine);
-
-      result = await syncFn((current: number, total: number, message: string) => {
-        if (cancelled) return;
-        progressModal.updateProgress(current, total, message);
-      });
+      progressModal.updateProgress(0, 1, "Syncing from OneNote...");
+      const result = await this.syncEngine.sync(forceAll);
 
       if (result.success) {
-        const msg = `Synced ${result.synced} notebook(s), ${result.skipped} up to date.`;
+        const msg = `Synced ${result.synced} page(s), ${result.skipped} up to date.`;
         progressModal.complete(msg);
         this.statusBar?.setIdle(Date.now());
       } else {
@@ -251,27 +188,9 @@ export default class KindleScribePlugin extends Plugin {
     }
   }
 
-  /** Get the configured OCR provider, or null if none selected. */
-  private getOCRProvider(): OCRProvider | null {
-    switch (this.settings.aiProvider) {
-      case "openrouter":
-        if (!this.settings.apiKey) return null;
-        return new OpenRouterProvider(this.settings.apiKey, this.settings.aiModel);
-      case "openai":
-        if (!this.settings.apiKey) return null;
-        return new OpenAIProvider(this.settings.apiKey, this.settings.aiModel);
-      case "anthropic":
-        if (!this.settings.apiKey) return null;
-        return new AnthropicProvider(this.settings.apiKey, this.settings.aiModel);
-      default:
-        return null;
-    }
-  }
-
   /** Set up the periodic sync interval. */
   private setupSyncInterval(): void {
     this.clearSyncInterval();
-
     if (this.settings.syncInterval > 0) {
       const intervalMs = this.settings.syncInterval * 60 * 1000;
       this.syncIntervalId = window.setInterval(() => {
@@ -294,9 +213,8 @@ export default class KindleScribePlugin extends Plugin {
     const raw = await this.loadData();
     return {
       settings: { ...DEFAULT_SETTINGS, ...(raw?.settings || {}) },
-      session: raw?.session || null,
+      msToken: raw?.msToken || null,
       syncState: raw?.syncState || createEmptySyncState(),
-      selectedNotebooks: raw?.selectedNotebooks || [],
     };
   }
 }

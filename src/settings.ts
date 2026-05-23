@@ -1,6 +1,5 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type KindleScribePlugin from "./main";
-import { MARKETPLACES } from "./api/types";
 import { DEFAULT_TEMPLATE } from "./output/templates";
 
 /** Supported output formats. */
@@ -9,8 +8,12 @@ export type OutputFormat = "pdf" | "images" | "transcribed" | "combined";
 /** Supported AI providers. */
 export type AIProvider = "none" | "openrouter" | "openai" | "anthropic";
 
+/** Supported sync sources. */
+export type SyncSource = "kindle-direct" | "onenote";
+
 /** Plugin settings interface. */
 export interface KindleScribeSettings {
+  syncSource: SyncSource;
   outputFolder: string;
   marketplace: string;
   outputFormat: OutputFormat;
@@ -21,10 +24,15 @@ export interface KindleScribeSettings {
   syncInterval: number;
   noteTemplate: string;
   pageDpi: number;
+  /** Microsoft App Client ID for OneNote access. */
+  msClientId: string;
+  /** Which OneNote notebook to sync from (by name or ID). */
+  onenoteNotebook: string;
 }
 
 /** Default settings values. */
 export const DEFAULT_SETTINGS: KindleScribeSettings = {
+  syncSource: "onenote",
   outputFolder: "Kindle Scribe",
   marketplace: "US",
   outputFormat: "combined",
@@ -35,6 +43,8 @@ export const DEFAULT_SETTINGS: KindleScribeSettings = {
   syncInterval: 0,
   noteTemplate: DEFAULT_TEMPLATE,
   pageDpi: 50,
+  msClientId: "",
+  onenoteNotebook: "",
 };
 
 /**
@@ -55,35 +65,52 @@ export class KindleScribeSettingTab extends PluginSettingTab {
     containerEl.addClass("kindle-scribe-settings");
 
     containerEl.createEl("h2", { text: "Kindle Scribe Sync" });
+    containerEl.createEl("p", {
+      text: "Syncs your Kindle Scribe notes from OneNote into Obsidian as markdown.",
+      cls: "setting-item-description",
+    });
 
-    // --- Connection Section ---
-    containerEl.createEl("h3", { text: "Connection" });
+    // --- Microsoft Connection ---
+    containerEl.createEl("h3", { text: "Microsoft Account" });
 
     new Setting(containerEl)
-      .setName("Amazon Marketplace")
-      .setDesc("Select your Amazon region.")
-      .addDropdown((dropdown) => {
-        for (const key of Object.keys(MARKETPLACES)) {
-          dropdown.addOption(key, key);
-        }
-        dropdown.setValue(this.plugin.settings.marketplace);
-        dropdown.onChange(async (value) => {
-          this.plugin.settings.marketplace = value;
+      .setName("App Client ID")
+      .setDesc("Azure App Registration Client ID. Required for OneNote access. See README for setup instructions.")
+      .addText((text) => {
+        text.setPlaceholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
+        text.setValue(this.plugin.settings.msClientId);
+        text.onChange(async (value) => {
+          this.plugin.settings.msClientId = value;
           await this.plugin.saveSettings();
         });
       });
 
     new Setting(containerEl)
-      .setName("Login to Amazon")
-      .setDesc("Authenticate with your Amazon account to access Kindle Scribe notebooks.")
+      .setName("Microsoft Account")
+      .setDesc("Sign in to access your OneNote notebooks.")
       .addButton((button) => {
         button.setButtonText("Login").onClick(async () => {
-          await this.plugin.loginToAmazon();
+          await this.plugin.loginToMicrosoft();
         });
       })
       .addButton((button) => {
         button.setButtonText("Logout").setWarning().onClick(async () => {
-          this.plugin.logoutFromAmazon();
+          await this.plugin.logoutFromMicrosoft();
+        });
+      });
+
+    // --- OneNote Settings ---
+    containerEl.createEl("h3", { text: "OneNote" });
+
+    new Setting(containerEl)
+      .setName("Notebook name")
+      .setDesc("Name of the OneNote notebook to sync from. Leave empty to sync from all notebooks.")
+      .addText((text) => {
+        text.setPlaceholder("My Notebook");
+        text.setValue(this.plugin.settings.onenoteNotebook);
+        text.onChange(async (value) => {
+          this.plugin.settings.onenoteNotebook = value;
+          await this.plugin.saveSettings();
         });
       });
 
@@ -101,87 +128,6 @@ export class KindleScribeSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
-
-    new Setting(containerEl)
-      .setName("Output format")
-      .setDesc("How to save synced notebooks.")
-      .addDropdown((dropdown) => {
-        dropdown.addOption("pdf", "PDF");
-        dropdown.addOption("images", "Markdown with images");
-        dropdown.addOption("transcribed", "Transcribed text (requires AI)");
-        dropdown.addOption("combined", "Combined (text + images)");
-        dropdown.setValue(this.plugin.settings.outputFormat);
-        dropdown.onChange(async (value) => {
-          this.plugin.settings.outputFormat = value as OutputFormat;
-          await this.plugin.saveSettings();
-          this.display(); // Refresh to show/hide AI settings
-        });
-      });
-
-    new Setting(containerEl)
-      .setName("Page DPI")
-      .setDesc("Render quality for page images. Higher = better quality but slower sync.")
-      .addSlider((slider) => {
-        slider.setLimits(25, 150, 25);
-        slider.setValue(this.plugin.settings.pageDpi);
-        slider.setDynamicTooltip();
-        slider.onChange(async (value) => {
-          this.plugin.settings.pageDpi = value;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    // --- AI / OCR Section ---
-    const needsAI =
-      this.plugin.settings.outputFormat === "transcribed" ||
-      this.plugin.settings.outputFormat === "combined";
-
-    if (needsAI) {
-      containerEl.createEl("h3", { text: "AI Transcription (OCR)" });
-
-      new Setting(containerEl)
-        .setName("AI Provider")
-        .setDesc("Select the AI service for handwriting transcription.")
-        .addDropdown((dropdown) => {
-          dropdown.addOption("none", "None (images only)");
-          dropdown.addOption("openrouter", "OpenRouter");
-          dropdown.addOption("openai", "OpenAI");
-          dropdown.addOption("anthropic", "Anthropic");
-          dropdown.setValue(this.plugin.settings.aiProvider);
-          dropdown.onChange(async (value) => {
-            this.plugin.settings.aiProvider = value as AIProvider;
-            await this.plugin.saveSettings();
-            this.display();
-          });
-        });
-
-      if (this.plugin.settings.aiProvider !== "none") {
-        new Setting(containerEl)
-          .setName("API Key")
-          .setDesc("Your API key for the selected provider.")
-          .addText((text) => {
-            text.setPlaceholder("sk-...");
-            text.setValue(this.plugin.settings.apiKey);
-            text.inputEl.type = "password";
-            text.onChange(async (value) => {
-              this.plugin.settings.apiKey = value;
-              await this.plugin.saveSettings();
-            });
-          });
-
-        new Setting(containerEl)
-          .setName("AI Model")
-          .setDesc("Model identifier to use for transcription.")
-          .addText((text) => {
-            text.setPlaceholder("google/gemini-2.5-flash");
-            text.setValue(this.plugin.settings.aiModel);
-            text.onChange(async (value) => {
-              this.plugin.settings.aiModel = value;
-              await this.plugin.saveSettings();
-            });
-          });
-      }
-    }
 
     // --- Sync Section ---
     containerEl.createEl("h3", { text: "Sync" });
@@ -216,7 +162,7 @@ export class KindleScribeSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Output template")
       .setDesc(
-        "Customize the markdown output. Available variables: {{title}}, {{date}}, {{modified}}, {{pages}}, {{content}}"
+        "Customize the markdown output. Variables: {{title}}, {{date}}, {{modified}}, {{pages}}, {{content}}"
       )
       .addTextArea((textarea) => {
         textarea.setPlaceholder(DEFAULT_TEMPLATE);
