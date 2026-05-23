@@ -60,6 +60,9 @@ export function getNotebooksToSync(
 
     if (!existing) {
       toSync.push({ ...notebook, reason: "new" });
+    } else if (notebook.modificationTime === 0) {
+      // modificationTime unknown from list API — always re-check
+      toSync.push({ ...notebook, reason: "modified" });
     } else if (notebook.modificationTime > existing.lastModified) {
       toSync.push({ ...notebook, reason: "modified" });
     }

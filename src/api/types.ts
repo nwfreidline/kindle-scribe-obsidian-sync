@@ -19,20 +19,29 @@ export const MARKETPLACES: Record<string, string> = {
 /** Base URL for the Kindle notebook API. */
 export const KINDLE_API_BASE = "https://read.amazon.com";
 
-/** Notebook metadata returned from the list endpoint. */
+/** Notebook metadata (normalized from the API response). */
 export interface NotebookMetadata {
+  /** Notebook UUID from the API. Also used as 'asin' for sync state compatibility. */
   asin: string;
   title: string;
   modificationTime: number;
   totalPages: number;
   marketplaceId: string;
-  authors?: string[];
-  coverImageUrl?: string;
+}
+
+/** Raw item from the notebook list API. */
+export interface RawNotebookItem {
+  id: string;
+  title: string;
+  type: string;
+  parentFolder: string;
+  items?: any[];
 }
 
 /** Response from the notebook list API. */
 export interface NotebookListResponse {
-  itemsList: NotebookMetadata[];
+  itemsList: RawNotebookItem[];
+  responseStatus: string;
 }
 
 /** Response from the openNotebook endpoint. */

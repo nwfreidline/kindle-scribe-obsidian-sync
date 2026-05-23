@@ -6,6 +6,7 @@ import {
   NotebookMetadata,
   OpenNotebookResponse,
   PageImage,
+  RawNotebookItem,
   RenderPageOptions,
 } from "./types";
 import { withRetry } from "../utils/retry";
@@ -42,7 +43,23 @@ export class NotebookClient {
       }
 
       const data: NotebookListResponse = await response.json();
-      return data.itemsList || [];
+      console.log("[Kindle Scribe] Notebook list API response:", JSON.stringify(data).substring(0, 500));
+      console.log(`[Kindle Scribe] Found ${data.itemsList?.length || 0} notebooks`);
+      if (data.itemsList && data.itemsList.length > 0) {
+        console.log("[Kindle Scribe] First notebook:", JSON.stringify(data.itemsList[0]));
+      }
+
+      // Map raw items to NotebookMetadata
+      // We'll get totalPages and modificationTime from openNotebook later
+      return (data.itemsList || [])
+        .filter((item: RawNotebookItem) => item.type === "notebook")
+        .map((item: RawNotebookItem) => ({
+          asin: item.id,
+          title: item.title,
+          modificationTime: 0, // Will be populated by openNotebook
+          totalPages: 0, // Will be populated by openNotebook
+          marketplaceId: "",
+        }));
     });
   }
 
@@ -67,7 +84,20 @@ export class NotebookClient {
         throw error;
       }
 
-      return response.json();
+      const data = await response.json();
+      console.log("[Kindle Scribe] openNotebook response:", JSON.stringify(data).substring(0, 500));
+
+      // The response structure may vary — handle flexibly
+      return {
+        metadata: {
+          currentPage: data.metadata?.currentPage || data.currentPage || 1,
+          modificationTime: data.metadata?.modificationTime || data.modificationTime || Date.now(),
+          title: data.metadata?.title || data.title || "",
+          totalPages: data.metadata?.totalPages || data.totalPages || data.pageCount || 0,
+        },
+        readingSessionId: data.readingSessionId || "",
+        renderingToken: data.renderingToken || data.metadata?.renderingToken || "",
+      };
     });
   }
 
@@ -120,33 +150,26 @@ export class NotebookClient {
       url.searchParams.set("height", (options.height || DEFAULT_HEIGHT).toString());
       url.searchParams.set("dpi", (options.dpi || 50).toString());
 
-      const response = await this.auth.makeAuthenticatedRequest(url.toString(), {
+      const tarBuffer = await this.auth.makeAuthenticatedBinaryRequest(url.toString(), {
         headers: {
           "x-amzn-karamel-notebook-rendering-token": renderingToken,
         },
       });
 
-      if (!response.ok) {
-        const error: any = new Error(
-          `Failed to render pages ${options.startPage}-${options.endPage}: ${response.status}`
-        );
-        error.status = response.status;
-        throw error;
-      }
-
-      const tarBuffer = await response.arrayBuffer();
       return this.extractImagesFromTar(tarBuffer, options.startPage);
     });
   }
 
   /**
    * Extract individual page images from a tar archive buffer.
-   * The tar format is simple: 512-byte headers followed by file data.
+   * The tar contains PaxHeaders, JSON metadata, and actual PNG/JPG images.
+   * We only want the image files.
    */
   extractImagesFromTar(tarBuffer: ArrayBuffer, startPage: number): PageImage[] {
     const pages: PageImage[] = [];
-    const view = new DataView(tarBuffer);
     let offset = 0;
+
+    console.log(`[Kindle Scribe] Extracting images from tar buffer: ${tarBuffer.byteLength} bytes`);
 
     while (offset < tarBuffer.byteLength - 512) {
       // Read tar header (512 bytes)
@@ -165,20 +188,29 @@ export class NotebookClient {
       offset += 512; // Move past header
 
       if (fileSize > 0 && filename) {
-        const imageData = tarBuffer.slice(offset, offset + fileSize);
-        const mimeType = filename.endsWith(".png") ? "image/png" : "image/jpeg";
+        // Only extract actual image files — skip PaxHeaders, JSON, and other metadata
+        const isImage = filename.endsWith(".png") || filename.endsWith(".jpg") || filename.endsWith(".jpeg");
+        const isPaxHeader = filename.includes("PaxHeaders");
 
-        pages.push({
-          pageNumber: startPage + pages.length,
-          data: imageData,
-          mimeType,
-        });
+        if (isImage && !isPaxHeader) {
+          const imageData = tarBuffer.slice(offset, offset + fileSize);
+          const mimeType = filename.endsWith(".png") ? "image/png" : "image/jpeg";
+
+          pages.push({
+            pageNumber: startPage + pages.length,
+            data: imageData,
+            mimeType,
+          });
+
+          console.log(`[Kindle Scribe] Extracted page ${startPage + pages.length - 1}: "${filename}" ${fileSize} bytes (${mimeType})`);
+        }
       }
 
       // Move to next header (file data is padded to 512-byte boundary)
       offset += Math.ceil(fileSize / 512) * 512;
     }
 
+    console.log(`[Kindle Scribe] Extracted ${pages.length} image(s) from tar`);
     return pages;
   }
 

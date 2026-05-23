@@ -4,61 +4,59 @@ import { AmazonSession, KINDLE_API_BASE } from "./types";
 const LOG = "[Kindle Scribe Auth]";
 
 /**
- * Manages Amazon authentication via Electron session cookies.
- * Provides login modal, session validation, and cookie extraction.
+ * Manages Amazon authentication using a hidden webview.
+ * 
+ * Instead of extracting cookies (which fails for HttpOnly cookies),
+ * this keeps a hidden webview element alive after login and routes
+ * all API calls through it via executeJavaScript(fetch(...)).
+ * The browser automatically includes all cookies (including HttpOnly).
  */
 export class AmazonAuthManager {
   private session: AmazonSession | null = null;
+  private webviewEl: HTMLElement | null = null;
+  private webviewReady = false;
 
   constructor(private app: App) {}
 
-  /** Returns the current session if valid, or null. */
   getSession(): AmazonSession | null {
     return this.session;
   }
 
-  /** Sets session from persisted data (loaded on plugin start). */
   restoreSession(session: AmazonSession | null): void {
     this.session = session;
     if (session) {
-      console.log(`${LOG} Restored session for marketplace: ${session.marketplace}, valid: ${session.isValid}`);
+      console.log(`${LOG} Restored session for marketplace: ${session.marketplace}`);
     }
   }
 
-  /** Check if we have a valid session. */
   isAuthenticated(): boolean {
     return this.session !== null && this.session.isValid;
   }
 
   /**
-   * Validate the current session by making a lightweight API call.
-   * Returns true if the session is still valid.
+   * Validate the current session by making a test API call.
    */
   async validateSession(): Promise<boolean> {
-    if (!this.session) {
-      console.log(`${LOG} No session to validate`);
-      return false;
+    if (!this.session) return false;
+
+    // If we have a live webview, test via that
+    if (this.webviewReady && this.webviewEl) {
+      try {
+        const result = await this.webviewFetch("/kindle-notebook/api/notes");
+        const isValid = result !== null && !result.startsWith("<!") && !result.startsWith("FETCH_ERROR");
+        this.session.isValid = isValid;
+        console.log(`${LOG} Session validation via webview: ${isValid}`);
+        return isValid;
+      } catch {
+        this.session.isValid = false;
+        return false;
+      }
     }
 
-    console.log(`${LOG} Validating session...`);
-    try {
-      const response = await requestUrl({
-        url: `${KINDLE_API_BASE}/kindle-notebook/api/notes`,
-        headers: {
-          Cookie: this.session.cookies,
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-      });
-      const isValid = response.status === 200;
-      this.session.isValid = isValid;
-      this.session.lastValidated = Date.now();
-      console.log(`${LOG} Session validation result: ${isValid} (status: ${response.status})`);
-      return isValid;
-    } catch (e: any) {
-      console.error(`${LOG} Session validation failed:`, e.message);
-      this.session.isValid = false;
-      return false;
-    }
+    // No webview — session is stale, need to re-login
+    console.log(`${LOG} No active webview, session needs re-login`);
+    this.session.isValid = false;
+    return false;
   }
 
   /**
@@ -66,21 +64,26 @@ export class AmazonAuthManager {
    */
   async login(marketplace: string): Promise<AmazonSession | null> {
     console.log(`${LOG} Opening login modal for marketplace: ${marketplace}`);
+
+    // Destroy any existing webview
+    this.destroyWebview();
+
     return new Promise((resolve) => {
-      const modal = new AmazonLoginModal(this.app, marketplace, (cookies) => {
-        if (cookies) {
-          console.log(`${LOG} Login successful, got ${cookies.length} chars of cookies`);
+      const modal = new AmazonLoginModal(this.app, marketplace, (webviewEl) => {
+        if (webviewEl) {
+          // Keep the webview alive for API calls
+          this.webviewEl = webviewEl;
+          this.webviewReady = true;
           this.session = {
-            cookies,
+            cookies: "__WEBVIEW_SESSION__",
             marketplace,
             isValid: true,
             lastValidated: Date.now(),
           };
+          console.log(`${LOG} Login successful, webview session active`);
           new Notice("Successfully logged in to Amazon.");
           resolve(this.session);
         } else {
-          console.warn(`${LOG} Login completed but no cookies extracted`);
-          new Notice("Login failed — could not extract session. Check console for details.");
           resolve(null);
         }
       });
@@ -88,80 +91,188 @@ export class AmazonAuthManager {
     });
   }
 
-  /** Clear the current session (logout). */
+  /** Clear the current session. */
   logout(): void {
+    this.destroyWebview();
     this.session = null;
     console.log(`${LOG} Session cleared`);
     new Notice("Logged out of Amazon.");
   }
 
   /**
-   * Make an authenticated request using Obsidian's requestUrl.
-   * This avoids CORS issues and works within the plugin sandbox.
+   * Make an authenticated API request by routing through the webview.
+   * The webview's browser session includes all HttpOnly cookies automatically.
    */
   async makeAuthenticatedRequest(
     url: string,
     options: { headers?: Record<string, string>; method?: string; body?: string } = {}
   ): Promise<Response> {
-    if (!this.session || !this.session.cookies) {
+    if (!this.session || !this.session.isValid) {
       throw new Error("Not authenticated. Please log in to Amazon first.");
     }
 
-    const headers: Record<string, string> = {
-      Cookie: this.session.cookies,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      ...(options.headers || {}),
-    };
+    if (!this.webviewEl || !this.webviewReady) {
+      throw new Error("Session expired. Please log in again.");
+    }
 
-    console.log(`${LOG} Request: ${options.method || "GET"} ${url}`);
+    const method = options.method || "GET";
+    console.log(`${LOG} Request: ${method} ${url}`);
 
-    const response = await requestUrl({
-      url,
-      method: options.method || "GET",
-      headers,
+    // Route the request through the webview
+    const result = await this.webviewFetch(url, {
+      method,
+      headers: options.headers,
       body: options.body,
     });
 
-    console.log(`${LOG} Response: ${response.status} from ${url}`);
+    if (result === null) {
+      throw new Error(`Request failed: no response from webview`);
+    }
 
-    // Wrap in a Response-like object for compatibility
+    // Determine if it's JSON or an error page
+    const isJson = result.startsWith("{") || result.startsWith("[");
+    const status = isJson ? 200 : 401;
+
+    console.log(`${LOG} Response: ${status} (${result.length} chars) from ${url}`);
+
     return {
-      ok: response.status >= 200 && response.status < 300,
-      status: response.status,
-      statusText: `${response.status}`,
-      json: () => Promise.resolve(response.json),
-      text: () => Promise.resolve(response.text),
-      arrayBuffer: () => Promise.resolve(response.arrayBuffer),
-      headers: new Headers(response.headers),
+      ok: status >= 200 && status < 300,
+      status,
+      statusText: `${status}`,
+      json: () => Promise.resolve(JSON.parse(result)),
+      text: () => Promise.resolve(result),
+      arrayBuffer: () => Promise.resolve(new TextEncoder().encode(result).buffer),
+      headers: new Headers(),
     } as unknown as Response;
+  }
+
+  /**
+   * Make a fetch request for binary data from inside the webview.
+   * Uses Blob + FileReader for reliable base64 encoding of large buffers.
+   */
+  async makeAuthenticatedBinaryRequest(
+    url: string,
+    options: { headers?: Record<string, string> } = {}
+  ): Promise<ArrayBuffer> {
+    if (!this.webviewEl || !this.webviewReady) {
+      throw new Error("Session expired. Please log in again.");
+    }
+
+    const headersJson = JSON.stringify(options.headers || {});
+
+    const base64 = await this.executeInWebview(`
+      (async () => {
+        try {
+          const resp = await fetch(${JSON.stringify(url)}, {
+            credentials: "include",
+            headers: ${headersJson}
+          });
+          if (!resp.ok) return "ERROR:" + resp.status;
+          const buf = await resp.arrayBuffer();
+          // Use Blob + FileReader for reliable base64 encoding
+          return new Promise((resolve, reject) => {
+            const blob = new Blob([buf]);
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const dataUrl = reader.result;
+              const base64Part = dataUrl.split(",")[1];
+              resolve(base64Part);
+            };
+            reader.onerror = () => reject("ERROR:FileReader failed");
+            reader.readAsDataURL(blob);
+          });
+        } catch(e) {
+          return "ERROR:" + e.message;
+        }
+      })()
+    `);
+
+    if (!base64 || (typeof base64 === "string" && base64.startsWith("ERROR:"))) {
+      throw new Error(`Binary request failed: ${base64}`);
+    }
+
+    // Decode base64 to ArrayBuffer
+    const binaryStr = atob(base64 as string);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    console.log(`${LOG} Binary response: ${bytes.length} bytes from ${url}`);
+    return bytes.buffer;
+  }
+
+  /** Execute a fetch inside the webview and return the text response. */
+  private async webviewFetch(
+    url: string,
+    options: { method?: string; headers?: Record<string, string>; body?: string } = {}
+  ): Promise<string | null> {
+    const fetchUrl = url.startsWith("http") ? url : `${KINDLE_API_BASE}${url}`;
+    const method = options.method || "GET";
+    const headersJson = JSON.stringify(options.headers || {});
+    const bodyArg = options.body ? `, body: ${JSON.stringify(options.body)}` : "";
+
+    const script = `
+      (async () => {
+        try {
+          const resp = await fetch(${JSON.stringify(fetchUrl)}, {
+            method: ${JSON.stringify(method)},
+            credentials: "include",
+            headers: ${headersJson}${bodyArg}
+          });
+          return await resp.text();
+        } catch(e) {
+          return "FETCH_ERROR:" + e.message;
+        }
+      })()
+    `;
+
+    return this.executeInWebview(script);
+  }
+
+  /** Execute JavaScript in the webview. */
+  private async executeInWebview(script: string): Promise<string | null> {
+    if (!this.webviewEl) return null;
+    const webview = this.webviewEl as any;
+    if (!webview.executeJavaScript) return null;
+
+    try {
+      return await webview.executeJavaScript(script);
+    } catch (e: any) {
+      console.error(`${LOG} executeJavaScript failed:`, e.message);
+      return null;
+    }
+  }
+
+  /** Destroy the hidden webview. */
+  private destroyWebview(): void {
+    if (this.webviewEl) {
+      this.webviewEl.remove();
+      this.webviewEl = null;
+      this.webviewReady = false;
+    }
   }
 }
 
 /**
- * Modal that displays Amazon's login page in a webview.
- * Extracts session cookies after successful authentication.
- *
- * Uses Electron's webview tag with a persistent partition.
- * Cookie extraction tries multiple approaches for compatibility
- * across different Electron/Obsidian versions.
+ * Login modal that shows Amazon's sign-in page.
+ * After login, passes the webview element back to the auth manager
+ * (instead of extracting cookies).
  */
 class AmazonLoginModal extends Modal {
   private marketplace: string;
-  private onComplete: (cookies: string | null) => void;
+  private onComplete: (webviewEl: HTMLElement | null) => void;
   private webviewEl: HTMLElement | null = null;
   private completed = false;
-  private partitionName: string;
 
   constructor(
     app: App,
     marketplace: string,
-    onComplete: (cookies: string | null) => void
+    onComplete: (webviewEl: HTMLElement | null) => void
   ) {
     super(app);
     this.marketplace = marketplace;
     this.onComplete = onComplete;
-    // Use a unique partition each time so there are NEVER cached cookies
-    this.partitionName = `kindle-scribe-${Date.now()}`;
   }
 
   onOpen(): void {
@@ -171,24 +282,11 @@ class AmazonLoginModal extends Modal {
     this.modalEl.style.height = "750px";
 
     contentEl.createEl("p", {
-      text: "Loading Amazon login...",
+      text: "Log in to your Amazon account. Once you see the Kindle notebook page, click Done.",
       cls: "kindle-scribe-login-instructions",
     });
 
-    // Render the login UI directly with a fresh partition
-    this.renderLoginUI(contentEl);
-  }
-
-  /** Render the webview login interface. */
-  private renderLoginUI(contentEl: HTMLElement): void {
-    contentEl.empty();
-
-    contentEl.createEl("p", {
-      text: "Log in to your Amazon account below. Once you see the Kindle notebook page (or your Amazon homepage after login), click the button to complete setup.",
-      cls: "kindle-scribe-login-instructions",
-    });
-
-    // Prominent "Done" button
+    // Done button
     const buttonRow = contentEl.createDiv();
     buttonRow.style.marginBottom = "8px";
     buttonRow.style.display = "flex";
@@ -202,299 +300,110 @@ class AmazonLoginModal extends Modal {
     hint.style.color = "var(--text-muted)";
 
     const doneBtn = buttonRow.createEl("button", {
-      text: "✓ Done — Extract Session",
+      text: "✓ Done — Complete Login",
       cls: "mod-cta",
     });
-    doneBtn.addEventListener("click", () => this.attemptCookieExtraction());
+    doneBtn.addEventListener("click", () => this.completeLogin());
 
-    // Use login URL directly (ephemeral partition means fresh start)
-    const loginUrl = this.getLoginUrl();
-    console.log(`${LOG} Using ephemeral partition: ${this.partitionName}`);
-    console.log(`${LOG} Login URL: ${loginUrl}`);
+    // Use a unique ephemeral partition — guarantees fresh login every time
+    const partitionName = `kindle-scribe-${Date.now()}`;
+    const loginUrl = "https://read.amazon.com/kindle-notebook";
+    console.log(`${LOG} Partition: ${partitionName}`);
+    console.log(`${LOG} Starting at: ${loginUrl}`);
 
-    // Create webview element for Amazon login
+    // Create webview
     this.webviewEl = contentEl.createEl("webview" as keyof HTMLElementTagNameMap) as any;
     const webview = this.webviewEl!;
-    // Start directly at login page (ephemeral partition = no cached cookies)
     webview.setAttribute("src", loginUrl);
     webview.setAttribute("style", "width: 100%; height: 600px; border: 1px solid var(--background-modifier-border); border-radius: 4px;");
-    // Ephemeral partition (no "persist:" prefix) — completely fresh, no cached cookies
-    webview.setAttribute("partition", this.partitionName);
+    webview.setAttribute("partition", partitionName);
     webview.setAttribute("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-    // Log all navigations for debugging (no auto-detection — user clicks button when ready)
     webview.addEventListener("did-navigate", (event: any) => {
-      const url = event.url || "";
-      console.log(`${LOG} Webview navigated to: ${url}`);
-    });
-
-    webview.addEventListener("did-navigate-in-page", (event: any) => {
-      const url = event.url || "";
-      console.log(`${LOG} Webview in-page navigation: ${url}`);
+      console.log(`${LOG} Navigated: ${event.url}`);
     });
 
     webview.addEventListener("did-fail-load", (event: any) => {
-      console.error(`${LOG} Webview failed to load:`, event.errorCode, event.errorDescription);
-      if (event.errorCode !== -3) { // -3 is aborted (normal during redirects)
-        new Notice(`Page load failed: ${event.errorDescription}`);
-      }
-    });
-
-    webview.addEventListener("dom-ready", () => {
-      console.log(`${LOG} Webview DOM ready`);
-    });
-
-    webview.addEventListener("console-message", (event: any) => {
-      // Forward webview console messages for debugging
-      if (event.level >= 2) { // warnings and errors
-        console.log(`${LOG} [webview console] ${event.message}`);
+      if (event.errorCode !== -3) {
+        console.error(`${LOG} Load failed: ${event.errorCode} ${event.errorDescription}`);
       }
     });
   }
 
   onClose(): void {
     if (!this.completed) {
-      console.log(`${LOG} Login modal closed without completing`);
+      console.log(`${LOG} Modal closed without completing`);
       this.onComplete(null);
     }
+    // Don't destroy the webview if login completed — it's now owned by the auth manager
+    if (!this.completed && this.webviewEl) {
+      this.webviewEl.remove();
+      this.webviewEl = null;
+    }
     this.contentEl.empty();
-    this.webviewEl = null;
   }
 
-  /** Check if a URL indicates successful login. */
-  private isPostLoginUrl(url: string): boolean {
-    // Only trigger on the actual Kindle notebook page, not intermediate redirects
-    const isPost = (
-      url.includes("read.amazon.com/kindle-notebook") ||
-      url.includes("read.amazon.com/notebook")
-    );
-    return isPost;
-  }
+  /** Verify login worked and pass the webview to the auth manager. */
+  private async completeLogin(): Promise<void> {
+    if (this.completed || !this.webviewEl) return;
 
-  /** Try to extract cookies and complete the login flow. */
-  private async attemptCookieExtraction(): Promise<void> {
-    if (this.completed) return;
+    const webview = this.webviewEl as any;
+    if (!webview.executeJavaScript) {
+      new Notice("Error: webview not ready");
+      return;
+    }
 
-    console.log(`${LOG} Attempting cookie extraction...`);
-    const cookies = await this.extractCookies();
+    const currentUrl = await webview.executeJavaScript("window.location.href");
+    console.log(`${LOG} Current webview URL: ${currentUrl}`);
+    console.log(`${LOG} Navigating webview directly to API endpoint...`);
 
-    if (cookies && cookies.length > 10) {
-      console.log(`${LOG} Successfully extracted ${cookies.length} chars of cookies`);
-      console.log(`${LOG} Cookie names: ${this.getCookieNames(cookies)}`);
+    // Navigate directly to the API endpoint — the browser will send all cookies
+    // (including HttpOnly) automatically since it's a same-origin-policy navigation
+    webview.setAttribute("src", "https://read.amazon.com/kindle-notebook/api/notes");
+
+    // Wait for it to load
+    await new Promise<void>((resolve) => {
+      const onFinish = () => {
+        webview.removeEventListener("did-finish-load", onFinish);
+        resolve();
+      };
+      webview.addEventListener("did-finish-load", onFinish);
+      setTimeout(resolve, 8000);
+    });
+
+    // Check what we got — if authenticated, the page content will be JSON
+    const newUrl = await webview.executeJavaScript("window.location.href");
+    console.log(`${LOG} After API navigation, URL is: ${newUrl}`);
+
+    const pageContent = await webview.executeJavaScript("document.body.innerText || document.body.textContent");
+    console.log(`${LOG} Page content (first 200): ${pageContent?.substring(0, 200)}`);
+
+    if (pageContent && (pageContent.startsWith("{") || pageContent.startsWith("["))) {
+      // We got JSON! The session works. The webview is on read.amazon.com/kindle-notebook/api/notes
+      // which is perfect for making API calls via fetch.
+      console.log(`${LOG} API access confirmed! Setting up webview proxy.`);
       this.completed = true;
-      this.onComplete(cookies);
+
+      // Move webview to hidden container
+      const oldContainer = document.getElementById("kindle-scribe-hidden-webview");
+      oldContainer?.remove();
+      const hiddenContainer = document.body.createDiv();
+      hiddenContainer.style.display = "none";
+      hiddenContainer.id = "kindle-scribe-hidden-webview";
+      hiddenContainer.appendChild(this.webviewEl);
+
+      this.onComplete(this.webviewEl);
+      this.webviewEl = null;
       this.close();
+    } else if (newUrl.includes("/ap/signin") || newUrl.includes("amazon.com/ap/")) {
+      // Redirected to login — the session isn't valid for read.amazon.com
+      console.error(`${LOG} Redirected to login page. SSO not working.`);
+      new Notice("Amazon session not recognized by Kindle service. Please log in again — make sure you complete the full login flow.");
+      // Navigate back to login
+      webview.setAttribute("src", "https://read.amazon.com/kindle-notebook");
     } else {
-      console.warn(`${LOG} Cookie extraction returned insufficient data: "${cookies?.substring(0, 50)}..."`);
-      new Notice("Could not extract cookies yet. Try clicking the button again after the page fully loads.");
-    }
-  }
-
-  /** Get just the cookie names for debug logging (not values). */
-  private getCookieNames(cookieStr: string): string {
-    return cookieStr
-      .split("; ")
-      .map((c) => c.split("=")[0])
-      .join(", ");
-  }
-
-  private getLoginUrl(): string {
-    const baseUrls: Record<string, string> = {
-      US: "https://www.amazon.com",
-      UK: "https://www.amazon.co.uk",
-      DE: "https://www.amazon.de",
-      FR: "https://www.amazon.fr",
-      ES: "https://www.amazon.es",
-      IT: "https://www.amazon.it",
-      JP: "https://www.amazon.co.jp",
-      CA: "https://www.amazon.ca",
-      AU: "https://www.amazon.com.au",
-      IN: "https://www.amazon.in",
-    };
-
-    const base = baseUrls[this.marketplace] || baseUrls["US"];
-    // Standard Amazon sign-in that redirects to the Kindle notebook page after login
-    const returnTo = encodeURIComponent("https://read.amazon.com/kindle-notebook");
-    return `${base}/ap/signin?openid.pape.max_auth_age=0&openid.return_to=${returnTo}&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=amzn_kindle_mykindle_us&openid.mode=checkid_setup&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0`;
-  }
-
-  private getSignOutUrl(): string {
-    const baseUrls: Record<string, string> = {
-      US: "https://www.amazon.com",
-      UK: "https://www.amazon.co.uk",
-      DE: "https://www.amazon.de",
-      FR: "https://www.amazon.fr",
-      ES: "https://www.amazon.es",
-      IT: "https://www.amazon.it",
-      JP: "https://www.amazon.co.jp",
-      CA: "https://www.amazon.ca",
-      AU: "https://www.amazon.com.au",
-      IN: "https://www.amazon.in",
-    };
-
-    const base = baseUrls[this.marketplace] || baseUrls["US"];
-    return `${base}/gp/flex/sign-out.html?action=sign-out&ref_=nav_AccountFlyout_signout`;
-  }
-
-  /**
-   * Extract cookies from the webview's Electron session.
-   * Tries multiple approaches for compatibility across Obsidian versions.
-   */
-  private async extractCookies(): Promise<string | null> {
-    // Approach 1: Electron session API (most reliable)
-    const sessionCookies = await this.extractViaSessionAPI();
-    if (sessionCookies) return sessionCookies;
-
-    // Approach 2: executeJavaScript on the webview
-    const jsCookies = await this.extractViaJavaScript();
-    if (jsCookies) return jsCookies;
-
-    // Approach 3: Try accessing the webContents directly
-    const wcCookies = await this.extractViaWebContents();
-    if (wcCookies) return wcCookies;
-
-    console.error(`${LOG} All cookie extraction methods failed`);
-    return null;
-  }
-
-  /** Approach 1: Use Electron's session.cookies API. */
-  private async extractViaSessionAPI(): Promise<string | null> {
-    try {
-      console.log(`${LOG} Trying session API extraction...`);
-
-      // In modern Obsidian, electron.remote may not be available
-      // Try multiple ways to access the session
-      let session: any = null;
-
-      // Try 1: Direct electron require
-      try {
-        const electron = require("electron");
-        if (electron.remote?.session) {
-          session = electron.remote.session;
-          console.log(`${LOG} Got session via electron.remote`);
-        }
-      } catch (e) {
-        console.log(`${LOG} electron.remote not available`);
-      }
-
-      // Try 2: @electron/remote package
-      if (!session) {
-        try {
-          const remote = require("@electron/remote");
-          session = remote.session;
-          console.log(`${LOG} Got session via @electron/remote`);
-        } catch (e) {
-          console.log(`${LOG} @electron/remote not available`);
-        }
-      }
-
-      if (!session) {
-        console.log(`${LOG} No session API available`);
-        return null;
-      }
-
-      const ses = session.fromPartition(this.partitionName);
-      const allCookies = await ses.cookies.get({});
-      console.log(`${LOG} Session API returned ${allCookies.length} total cookies`);
-
-      // Filter to Amazon-related cookies
-      const amazonCookies = allCookies.filter(
-        (cookie: any) =>
-          cookie.domain.includes("amazon") ||
-          cookie.domain.includes(".amazon.")
-      );
-
-      console.log(`${LOG} Found ${amazonCookies.length} Amazon cookies`);
-
-      if (amazonCookies.length === 0) {
-        return null;
-      }
-
-      // Check for critical auth cookies
-      const cookieNames = amazonCookies.map((c: any) => c.name);
-      const hasSessionId = cookieNames.some((n: string) =>
-        n.includes("session-id") || n.includes("ubid") || n.includes("at-main")
-      );
-      console.log(`${LOG} Has auth-related cookies: ${hasSessionId}`);
-      console.log(`${LOG} Cookie names: ${cookieNames.join(", ")}`);
-
-      return amazonCookies
-        .map((cookie: any) => `${cookie.name}=${cookie.value}`)
-        .join("; ");
-    } catch (e: any) {
-      console.warn(`${LOG} Session API extraction failed:`, e.message);
-      return null;
-    }
-  }
-
-  /** Approach 2: Execute JavaScript in the webview to get document.cookie. */
-  private async extractViaJavaScript(): Promise<string | null> {
-    try {
-      console.log(`${LOG} Trying JavaScript extraction...`);
-
-      if (!this.webviewEl) {
-        console.log(`${LOG} No webview element available`);
-        return null;
-      }
-
-      const webview = this.webviewEl as any;
-      if (!webview.executeJavaScript) {
-        console.log(`${LOG} webview.executeJavaScript not available`);
-        return null;
-      }
-
-      const cookies = await webview.executeJavaScript("document.cookie");
-      console.log(`${LOG} JavaScript extraction got ${cookies?.length || 0} chars`);
-
-      if (cookies && cookies.length > 10) {
-        return cookies;
-      }
-      return null;
-    } catch (e: any) {
-      console.warn(`${LOG} JavaScript extraction failed:`, e.message);
-      return null;
-    }
-  }
-
-  /** Approach 3: Access webContents session directly. */
-  private async extractViaWebContents(): Promise<string | null> {
-    try {
-      console.log(`${LOG} Trying webContents extraction...`);
-
-      if (!this.webviewEl) return null;
-
-      const webview = this.webviewEl as any;
-
-      // The webview element has a getWebContentsId() method in Electron
-      if (webview.getWebContentsId) {
-        const id = webview.getWebContentsId();
-        console.log(`${LOG} WebContents ID: ${id}`);
-
-        // Try to get the session from the webContents
-        const electron = require("electron");
-        if (electron.remote) {
-          const wc = electron.remote.webContents.fromId(id);
-          if (wc) {
-            const allCookies = await wc.session.cookies.get({});
-            const amazonCookies = allCookies.filter(
-              (cookie: any) =>
-                cookie.domain.includes("amazon") ||
-                cookie.domain.includes(".amazon.")
-            );
-            if (amazonCookies.length > 0) {
-              console.log(`${LOG} WebContents extraction got ${amazonCookies.length} cookies`);
-              return amazonCookies
-                .map((cookie: any) => `${cookie.name}=${cookie.value}`)
-                .join("; ");
-            }
-          }
-        }
-      }
-
-      return null;
-    } catch (e: any) {
-      console.warn(`${LOG} WebContents extraction failed:`, e.message);
-      return null;
+      console.error(`${LOG} Unexpected response. URL: ${newUrl}, Content: ${pageContent?.substring(0, 100)}`);
+      new Notice("Could not verify Kindle access. Check console for details.");
     }
   }
 }
